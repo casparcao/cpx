@@ -3,6 +3,10 @@ use ssh2::Session;
 use std::io::prelude::*;
 use std::net::TcpStream;
 use std::path::Path;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::io::{self, Write};
 
 pub struct SshTransfer {
     session: Session,
@@ -30,12 +34,57 @@ impl SshTransfer {
         session.set_tcp_stream(tcp);
         session.handshake()?;
 
-        // Try to authenticate with ssh-agent first
-        if session.userauth_agent(&user).is_err() {
-            // If ssh-agent fails, try with a password (will need to be provided)
-            // For now, we'll return an error - in a real implementation you might
-            // want to prompt for a password or support key files
-            return Err(anyhow::anyhow!("Unable to authenticate with SSH agent. Manual authentication not yet implemented."));
+        // Try various authentication methods in order of preference
+        let mut auth_success = false;
+        
+        // 1. Try ssh-agent authentication first
+        if session.userauth_agent(&user).is_ok() {
+            auth_success = true;
+        }
+        
+        // 2. Try public key authentication
+        if !auth_success {
+            if let Ok(home_dir) = env::var("HOME")
+                    .or_else(|_err| env::var("USERPROFILE")) {
+                let mut ssh_path = PathBuf::new();
+                ssh_path.push(home_dir);
+                ssh_path.push(".ssh");
+            
+                let pub_key_path = ssh_path.join("id_rsa.pub");
+                let priv_key_path = ssh_path.join("id_rsa");
+                println!("Using public key authentication with keys at {} and {}", pub_key_path.display(), priv_key_path.display());
+                
+                if fs::metadata(&pub_key_path).is_ok() && fs::metadata(&priv_key_path).is_ok() {
+                    // Try to authenticate with default RSA keys
+                    if session.userauth_pubkey_file(&user, Some(&pub_key_path), &priv_key_path, None).is_ok() {
+                        auth_success = true;
+                    }
+                }
+            }
+        }
+        
+        // 3. Try password authentication
+        if !auth_success {
+            // Try to get password from environment variable first
+            if let Ok(password) = env::var("SSH_PASSWORD") {
+                if session.userauth_password(&user, &password).is_ok() {
+                    auth_success = true;
+                }
+            }
+            
+            // If environment variable not set or authentication failed, prompt user for password
+            if !auth_success {
+                print!("Password for {}@{}: ", user, host);
+                io::stdout().flush()?;
+                let password = read_password()?;
+                if session.userauth_password(&user, &password).is_ok() {
+                    auth_success = true;
+                }
+            }
+        }
+
+        if !auth_success {
+            return Err(anyhow::anyhow!("Unable to authenticate with SSH server. Please ensure you have set up SSH keys, ssh-agent, or provide a valid password."));
         }
 
         Ok(SshTransfer {
@@ -103,6 +152,11 @@ impl SshTransfer {
         
         Ok(output)
     }
+}
+
+fn read_password() -> Result<String> {
+    let password = rpassword::read_password()?;
+    Ok(password)
 }
 
 fn parse_ssh_destination(destination: &str) -> Result<(String, String)> {
