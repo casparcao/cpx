@@ -8,6 +8,9 @@ use tokio::sync::Semaphore;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 
+mod ssh;
+use ssh::SshTransfer;
+
 const PARALLELISM: usize = 8;
 
 #[derive(Parser, Debug)]
@@ -26,6 +29,10 @@ struct Args {
     /// Number of parallel workers
     #[arg(short, long, default_value_t = PARALLELISM)]
     jobs: usize,
+
+    /// Use SSH for remote transfer
+    #[arg(long)]
+    ssh: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -178,6 +185,16 @@ async fn send_file(
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    if args.ssh {
+        handle_ssh_transfer(args).await?;
+    } else {
+        handle_local_transfer(args).await?;
+    }
+    
+    Ok(())
+}
+
+async fn handle_local_transfer(args: Args) -> anyhow::Result<()> {
     let src_root = Path::new(&args.source[0]).parent().unwrap_or(&args.source[0]);
     let dest_root = Path::new(&args.destination);
 
@@ -229,4 +246,105 @@ async fn main() -> anyhow::Result<()> {
 
     println!("✅ Transfer completed!");
     Ok(())
+}
+
+async fn handle_ssh_transfer(args: Args) -> anyhow::Result<()> {
+    // Parse destination
+    let (_ssh_dest, remote_path) = parse_ssh_destination(&args.destination)?;
+    let remote_root = Path::new(&remote_path);
+
+    // Connect via SSH
+    println!("🔗 Connecting via SSH...");
+    let mut ssh_transfer = SshTransfer::new(&args.destination)?;
+
+    let src_root = Path::new(&args.source[0]).parent().unwrap_or(&args.source[0]);
+
+    // Step 1: Collect metadata
+    println!("🔍 Collecting metadata...");
+    let manifest = collect_metadata(&args.source).await?;
+
+    // Step 2: Create remote directory structure
+    println!("📁 Creating remote directory structure...");
+    for file in &manifest.files {
+        if let Some(parent) = remote_root.join(&file.path).parent() {
+            let _ = ssh_transfer.create_remote_dir(parent.to_str().unwrap());
+        }
+    }
+
+    // Step 3: Transfer files
+    println!("🚀 Starting SSH transfer ({} jobs)...", args.jobs);
+    let m = MultiProgress::new();
+    let sty = ProgressStyle::default_bar()
+        .template("{msg} {bar:40} {bytes}/{total_bytes} ({eta})")?;
+
+    let semaphore = Arc::new(Semaphore::new(args.jobs));
+    let mut handles = vec![];
+    let ssh_transfer = Arc::new(ssh_transfer);
+
+    for file in manifest.files {
+        let pb = m.add(ProgressBar::new(file.size));
+        pb.set_style(sty.clone());
+        pb.set_message(file.path.clone());
+
+        let src_path = src_root.join(&file.path);
+        let remote_path = remote_root.join(&file.path);
+        let sem = semaphore.clone();
+        let ssh_transfer = ssh_transfer.clone();
+
+        let h = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            
+            // Read file data
+            let mut file_data = Vec::new();
+            let mut input_file = match File::open(&src_path) {
+                Ok(file) => file,
+                Err(_) => {
+                    pb.finish_with_message("failed to open");
+                    return;
+                }
+            };
+            
+            match input_file.read_to_end(&mut file_data) {
+                Ok(_) => {},
+                Err(_) => {
+                    pb.finish_with_message("failed to read");
+                    return;
+                }
+            };
+            
+            // Send via SSH
+            let result = ssh_transfer.send_file_data(remote_path.to_str().unwrap(), &file_data);
+            if result.is_ok() {
+                pb.finish_with_message("done");
+            } else {
+                pb.finish_with_message("failed");
+            }
+        });
+
+        handles.push(h);
+    }
+
+    // Wait for all transfers
+    for h in handles {
+        let _ = h.await;
+    }
+
+    println!("✅ SSH transfer completed!");
+    Ok(())
+}
+
+// Helper function to parse SSH destination
+fn parse_ssh_destination(destination: &str) -> anyhow::Result<(String, String)> {
+    // Format: user@host:path
+    if let Some(at_pos) = destination.find('@') {
+        if let Some(colon_pos) = destination.find(':') {
+            if colon_pos > at_pos {
+                let ssh_part = destination[..colon_pos].to_string();
+                let path_part = destination[colon_pos + 1..].to_string();
+                return Ok((ssh_part, path_part));
+            }
+        }
+    }
+    
+    Err(anyhow::anyhow!("Invalid SSH destination format. Expected user@host:path"))
 }
