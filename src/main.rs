@@ -201,7 +201,6 @@ async fn handle_local_transfer(args: Args) -> anyhow::Result<()> {
     // Step 1: Collect metadata
     println!("🔍 Collecting metadata...");
     let manifest = collect_metadata(&args.source).await?;
-    let total_size: u64 = manifest.files.iter().map(|f| f.size).sum();
 
     // Step 2: Create destination structure
     println!("📁 Creating destination structure...");
@@ -214,25 +213,28 @@ async fn handle_local_transfer(args: Args) -> anyhow::Result<()> {
 
     // Step 3: Parallel transfer
     println!("🚀 Starting parallel transfer ({} jobs)...", args.jobs);
-    let m = MultiProgress::new();
-    let sty = ProgressStyle::default_bar()
-        .template("{msg} {bar:40} {bytes}/{total_bytes} ({eta})")?;
+    let m = Arc::new(MultiProgress::new());
 
     let semaphore = Arc::new(Semaphore::new(args.jobs));
     let mut handles = vec![];
 
     for file in manifest.files {
-        let pb = m.add(ProgressBar::new(file.size));
-        pb.set_style(sty.clone());
-        pb.set_message(file.path.clone());
-
         let src_root = src_root.to_path_buf();
         let dest_root = dest_root.to_path_buf();
         let file_info = file;
         let sem = semaphore.clone();
+        let m = m.clone();
+        let size = file_info.size;
+        let path = file_info.path.clone();
 
         let h = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
+            let pb = m.add(ProgressBar::new(size));
+            let sty = ProgressStyle::with_template("{bar:40} {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("=>-");
+            pb.set_style(sty);
+            pb.set_message(path);
             let _ = send_file(&src_root, &dest_root, &file_info, pb).await;
         });
 
@@ -255,7 +257,7 @@ async fn handle_ssh_transfer(args: Args) -> anyhow::Result<()> {
 
     // Connect via SSH
     println!("🔗 Connecting via SSH...");
-    let mut ssh_transfer = SshTransfer::new(&args.destination)?;
+    let ssh_transfer = SshTransfer::new(&args.destination)?;
 
     let src_root = Path::new(&args.source[0]).parent().unwrap_or(&args.source[0]);
 
