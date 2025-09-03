@@ -273,26 +273,28 @@ async fn handle_ssh_transfer(args: Args) -> anyhow::Result<()> {
 
     // Step 3: Transfer files
     println!("🚀 Starting SSH transfer ({} jobs)...", args.jobs);
-    let m = MultiProgress::new();
-    let sty = ProgressStyle::default_bar()
-        .template("{msg} {bar:40} {bytes}/{total_bytes} ({eta})")?;
+    let m = Arc::new(MultiProgress::new());
 
     let semaphore = Arc::new(Semaphore::new(args.jobs));
     let mut handles = vec![];
     let ssh_transfer = Arc::new(ssh_transfer);
 
     for file in manifest.files {
-        let pb = m.add(ProgressBar::new(file.size));
-        pb.set_style(sty.clone());
-        pb.set_message(file.path.clone());
 
         let src_path = src_root.join(&file.path);
         let remote_path = remote_root.join(&file.path);
         let sem = semaphore.clone();
         let ssh_transfer = ssh_transfer.clone();
+        let m = m.clone();
 
         let h = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
+            let pb = m.add(ProgressBar::new(file.size));
+            let sty = ProgressStyle::with_template("{bar:40} {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("=>-");
+            pb.set_style(sty);
+            pb.set_message(file.path.clone());
             
             // Read file data
             let mut file_data = Vec::new();
@@ -315,7 +317,7 @@ async fn handle_ssh_transfer(args: Args) -> anyhow::Result<()> {
             // Send via SSH
             let result = ssh_transfer.send_file_data(remote_path.to_str().unwrap(), &file_data);
             if result.is_ok() {
-                pb.finish_with_message("done");
+                pb.finish_and_clear();
             } else {
                 pb.finish_with_message("failed");
             }
