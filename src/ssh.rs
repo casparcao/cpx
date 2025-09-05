@@ -15,10 +15,7 @@ pub struct SshTransfer {
 }
 
 impl SshTransfer {
-    pub fn new(destination: &str) -> Result<Self> {
-        // Parse destination in format user@host:path
-        let (ssh_dest, path) = parse_ssh_destination(destination)?;
-        
+    pub fn new((ssh_dest, path): (&str, &str)) -> Result<Self> {
         // Further parse user@host into user and host
         let parts: Vec<&str> = ssh_dest.split('@').collect();
         let (user, host) = if parts.len() == 2 {
@@ -90,7 +87,7 @@ impl SshTransfer {
         Ok(SshTransfer {
             session,
             host,
-            path,
+            path: path.to_string(),
         })
     }
 
@@ -157,24 +154,4 @@ impl SshTransfer {
 fn read_password() -> Result<String> {
     let password = rpassword::read_password()?;
     Ok(password)
-}
-
-fn parse_ssh_destination(destination: &str) -> Result<(String, String)> {
-    // Format: user@host:path
-    if let Some(at_pos) = destination.find('@') {
-        if let Some(colon_pos) = destination.find(':') {
-            if colon_pos > at_pos {
-                let ssh_part = destination[..colon_pos].to_string();
-                let path_part = destination[colon_pos + 1..].to_string();
-                return Ok((ssh_part, path_part));
-            }
-        }
-    } else if let Some(colon_pos) = destination.find(':') {
-        // Format: host:path (no user specified)
-        let host_part = destination[..colon_pos].to_string();
-        let path_part = destination[colon_pos + 1..].to_string();
-        return Ok((host_part, path_part));
-    }
-    
-    Err(anyhow::anyhow!("Invalid SSH destination format. Expected user@host:path or host:path"))
 }

@@ -17,22 +17,21 @@ const PARALLELISM: usize = 8;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Source directory or files
+    #[clap(required = true)]
     source: Vec<PathBuf>,
 
     /// Destination in format user@host:path or local/path
+    #[clap(required = true)]
     destination: String,
 
     /// Enable compression for compressible files
-    #[arg(short, long)]
+    #[arg(short, long, default_value_t = true)]
     compress: bool,
 
     /// Number of parallel workers
     #[arg(short, long, default_value_t = PARALLELISM)]
     jobs: usize,
 
-    /// Use SSH for remote transfer
-    #[arg(long)]
-    ssh: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -185,10 +184,14 @@ async fn send_file(
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    if args.ssh {
+    let dest_parts = args.destination.split(":").collect::<Vec<_>>();
+
+    if dest_parts.len() == 2 {
         handle_ssh_transfer(args).await?;
-    } else {
+    } else if dest_parts.len() == 1 {
         handle_local_transfer(args).await?;
+    } else {
+        anyhow::bail!("Invalid destination format");
     }
     
     Ok(())
@@ -230,7 +233,7 @@ async fn handle_local_transfer(args: Args) -> anyhow::Result<()> {
         let h = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let pb = m.add(ProgressBar::new(size));
-            let sty = ProgressStyle::with_template("{bar:40} {bytes}/{total_bytes} ({eta})")
+            let sty = ProgressStyle::with_template("{msg:20} {bar:40} {bytes}/{total_bytes} ({eta})")
                 .unwrap()
                 .progress_chars("=>-");
             pb.set_style(sty);
@@ -252,12 +255,12 @@ async fn handle_local_transfer(args: Args) -> anyhow::Result<()> {
 
 async fn handle_ssh_transfer(args: Args) -> anyhow::Result<()> {
     // Parse destination
-    let (_ssh_dest, remote_path) = parse_ssh_destination(&args.destination)?;
+    let (ssh_dest, remote_path) = parse_ssh_destination(&args.destination)?;
     let remote_root = Path::new(&remote_path);
 
     // Connect via SSH
     println!("🔗 Connecting via SSH...");
-    let ssh_transfer = SshTransfer::new(&args.destination)?;
+    let ssh_transfer = SshTransfer::new((&ssh_dest, &remote_path))?;
 
     let src_root = Path::new(&args.source[0]).parent().unwrap_or(&args.source[0]);
 
@@ -269,6 +272,7 @@ async fn handle_ssh_transfer(args: Args) -> anyhow::Result<()> {
     println!("📁 Creating remote directory structure...");
     for file in &manifest.files {
         if let Some(parent) = remote_root.join(&file.path).parent() {
+            println!("Creating remote directory: {}", parent.display());
             let _ = ssh_transfer.create_remote_dir(parent.to_str().unwrap());
         }
     }
@@ -292,7 +296,7 @@ async fn handle_ssh_transfer(args: Args) -> anyhow::Result<()> {
         let h = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let pb = m.add(ProgressBar::new(file.size));
-            let sty = ProgressStyle::with_template("{bar:40} {bytes}/{total_bytes} ({eta})")
+            let sty = ProgressStyle::with_template("{msg:20} {bar:40} {bytes}/{total_bytes} ({eta})")
                 .unwrap()
                 .progress_chars("=>-");
             pb.set_style(sty);
@@ -340,15 +344,10 @@ async fn handle_ssh_transfer(args: Args) -> anyhow::Result<()> {
 // Helper function to parse SSH destination
 fn parse_ssh_destination(destination: &str) -> anyhow::Result<(String, String)> {
     // Format: user@host:path
-    if let Some(at_pos) = destination.find('@') {
-        if let Some(colon_pos) = destination.find(':') {
-            if colon_pos > at_pos {
-                let ssh_part = destination[..colon_pos].to_string();
-                let path_part = destination[colon_pos + 1..].to_string();
-                return Ok((ssh_part, path_part));
-            }
-        }
+    let dest_parts: Vec<&str> = destination.split(":").collect();
+    if dest_parts.len() == 2 {
+        return Ok((dest_parts[0].to_string(), dest_parts[1].to_string()));
+    }else{
+        Err(anyhow::anyhow!("Invalid SSH destination format. Expected user@host:path"))
     }
-    
-    Err(anyhow::anyhow!("Invalid SSH destination format. Expected user@host:path"))
 }
