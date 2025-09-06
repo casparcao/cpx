@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 
 mod ssh;
 use ssh::SshTransfer;
+mod utils;
 
 const PARALLELISM: usize = 8;
 
@@ -233,11 +234,11 @@ async fn handle_local_transfer(args: Args) -> anyhow::Result<()> {
         let h = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let pb = m.add(ProgressBar::new(size));
-            let sty = ProgressStyle::with_template("{msg:20} {bar:40} {bytes}/{total_bytes} ({eta})")
+            let sty = ProgressStyle::with_template("{msg} {bar:40} {bytes}/{total_bytes} ({eta})")
                 .unwrap()
                 .progress_chars("=>-");
             pb.set_style(sty);
-            pb.set_message(path);
+            pb.set_message(utils::align_str(&path, 20));
             let _ = send_file(&src_root, &dest_root, &file_info, pb).await;
         });
 
@@ -296,11 +297,11 @@ async fn handle_ssh_transfer(args: Args) -> anyhow::Result<()> {
         let h = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let pb = m.add(ProgressBar::new(file.size));
-            let sty = ProgressStyle::with_template("{msg:20} {bar:40} {bytes}/{total_bytes} ({eta})")
+            let sty = ProgressStyle::with_template("{msg} {bar:40} {bytes}/{total_bytes} ({eta})")
                 .unwrap()
                 .progress_chars("=>-");
             pb.set_style(sty);
-            pb.set_message(file.path.clone());
+            pb.set_message(utils::align_str(&file.path, 20));
             
             // Read file data
             let mut file_data = Vec::new();
