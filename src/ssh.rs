@@ -1,6 +1,9 @@
 use anyhow::Result;
+use indicatif::ProgressBar;
 use ssh2::Session;
+use std::fs::File;
 use std::io::prelude::*;
+use std::io::BufReader;
 use std::net::TcpStream;
 use std::path::Path;
 use std::env;
@@ -10,12 +13,10 @@ use std::io::{self, Write};
 
 pub struct SshTransfer {
     session: Session,
-    host: String,
-    path: String,
 }
 
 impl SshTransfer {
-    pub fn new((ssh_dest, path): (&str, &str)) -> Result<Self> {
+    pub fn new(ssh_dest: &str) -> Result<Self> {
         // Further parse user@host into user and host
         let parts: Vec<&str> = ssh_dest.split('@').collect();
         let (user, host) = if parts.len() == 2 {
@@ -86,42 +87,48 @@ impl SshTransfer {
 
         Ok(SshTransfer {
             session,
-            host,
-            path: path.to_string(),
         })
     }
 
 
-    pub fn send_file_data(&self, remote_path: &str, data: &[u8]) -> Result<()> {
+    pub fn send_file(
+        &self,
+        src_root: PathBuf,
+        dest_root: PathBuf,
+        path: PathBuf,
+        size: u64,
+        pb: ProgressBar) -> Result<()> {
         // Create full remote path
-        let full_remote_path = if self.path.ends_with('/') {
-            format!("{}{}", self.path, remote_path)
-        } else {
-            format!("{}/{}", self.path, remote_path)
-        };
+        let remote_path = dest_root.join(&path);
+        self.create_remote_dir(&dest_root.to_str().unwrap())?;
 
-        // Create directory if needed
-        let remote_dir = Path::new(&full_remote_path).parent()
-            .ok_or_else(|| anyhow::anyhow!("Invalid remote path"))?
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in remote path"))?;
-
-        self.create_remote_dir(remote_dir)?;
+        let mut input = BufReader::new(File::open(&src_root.join(&path))?);
+        let mut buffer = vec![0; 8192];
+        let mut written = 0u64;
 
         // Use SCP to send file data
         let mut channel = self.session.scp_send(
-            Path::new(&full_remote_path), 
+            Path::new(&remote_path), 
             0o644, 
-            data.len() as u64, 
+            size, 
             None
         )?;
-        
-        channel.write_all(data)?;
+
+        loop {
+            let n = input.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            let data = &buffer[..n];
+            channel.write_all(data)?;
+            written += n as u64;
+            pb.set_position(written);
+        }
         channel.send_eof()?;
         channel.wait_eof()?;
         channel.close()?;
         channel.wait_close()?;
-
+        pb.finish_and_clear();
         Ok(())
     }
 
@@ -136,19 +143,6 @@ impl SshTransfer {
         Ok(())
     }
 
-    pub fn execute_command(&self, command: &str) -> Result<String> {
-        let mut channel = self.session.channel_session()?;
-        channel.exec(command)?;
-        
-        let mut output = String::new();
-        channel.read_to_string(&mut output)?;
-        channel.send_eof()?;
-        channel.wait_eof()?;
-        channel.close()?;
-        channel.wait_close()?;
-        
-        Ok(output)
-    }
 }
 
 fn read_password() -> Result<String> {
