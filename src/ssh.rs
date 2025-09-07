@@ -101,7 +101,7 @@ impl SshTransfer {
         // Create full remote path
         println!("Sending file: {}, {}, {}", src_root.display(), dest_root.display(), path.display());
         let remote_path = dest_root.join(&path);
-        self.create_remote_dir(&dest_root.to_str().unwrap())?;
+        self.create_remote_dir(&dest_root.join(&path).parent().unwrap_or(&dest_root).to_str().unwrap())?;
 
         let mut input = BufReader::new(File::open(&src_root.join(&path))?);
         let mut buffer = vec![0; 8192];
@@ -137,9 +137,6 @@ impl SshTransfer {
         // Execute mkdir command to create directory
         let mut channel = self.session.channel_session()?;
         channel.exec(&format!("mkdir -p {}", remote_path))?;
-        let mut s = String::new();
-        channel.read_to_string(&mut s)?;
-        println!("mkdir output: {}", s);
         channel.send_eof()?;
         channel.wait_eof()?;
         channel.close()?;
