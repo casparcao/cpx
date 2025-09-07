@@ -7,7 +7,6 @@ use tokio::sync::Semaphore;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 mod ssh;
-use ssh::SshTransfer;
 mod utils;
 
 const PARALLELISM: usize = 8;
