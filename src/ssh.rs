@@ -10,8 +10,135 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+
+pub struct SshConnectionPool {
+    connections: Arc<Mutex<VecDeque<Session>>>,
+    ssh_dest: String,
+    max_connections: usize,
+}
+
+impl SshConnectionPool {
+    pub fn new(ssh_dest: String, max_connections: usize) -> Result<Self> {
+        let pool = SshConnectionPool {
+            connections: Arc::new(Mutex::new(VecDeque::new())),
+            ssh_dest,
+            max_connections,
+        };
+        
+        // Pre-create one connection to test the setup
+        let session = pool.create_new_connection()?;
+        pool.connections.lock().unwrap().push_back(session);
+        
+        Ok(pool)
+    }
+    
+    fn create_new_connection(&self) -> Result<Session> {
+        // Further parse user@host into user and host
+        let parts: Vec<&str> = self.ssh_dest.split('@').collect();
+        let (user, host) = if parts.len() == 2 {
+            (parts[0].to_string(), parts[1].to_string())
+        } else {
+            // Default to current user if no user specified
+            (whoami::username(), self.ssh_dest.to_string())
+        };
+
+        // Connect to SSH server (assuming default SSH port 22)
+        let tcp = TcpStream::connect(&(host.as_str(), 22))?;
+        let mut session = Session::new()?;
+        session.set_tcp_stream(tcp);
+        session.handshake()?;
+
+        // Try various authentication methods in order of preference
+        let mut auth_success = false;
+        
+        // 1. Try ssh-agent authentication first
+        if session.userauth_agent(&user).is_ok() {
+            auth_success = true;
+        }
+        
+        // 2. Try public key authentication
+        if !auth_success {
+            if let Ok(home_dir) = env::var("HOME")
+                    .or_else(|_err| env::var("USERPROFILE")) {
+                let mut ssh_path = PathBuf::new();
+                ssh_path.push(home_dir);
+                ssh_path.push(".ssh");
+            
+                let pub_key_path = ssh_path.join("id_rsa.pub");
+                let priv_key_path = ssh_path.join("id_rsa");
+                println!("Using public key authentication with keys at {} and {}", pub_key_path.display(), priv_key_path.display());
+                
+                if fs::metadata(&pub_key_path).is_ok() && fs::metadata(&priv_key_path).is_ok() {
+                    // Try to authenticate with default RSA keys
+                    if session.userauth_pubkey_file(&user, Some(&pub_key_path), &priv_key_path, None).is_ok() {
+                        auth_success = true;
+                    }
+                }
+            }
+        }
+        
+        // 3. Try password authentication
+        if !auth_success {
+            // Try to get password from environment variable first
+            if let Ok(password) = env::var("SSH_PASSWORD") {
+                if session.userauth_password(&user, &password).is_ok() {
+                    auth_success = true;
+                }
+            }
+            
+            // If environment variable not set or authentication failed, prompt user for password
+            if !auth_success {
+                print!("Password for {}@{}: ", user, host);
+                io::stdout().flush()?;
+                let password = read_password()?;
+                if session.userauth_password(&user, &password).is_ok() {
+                    auth_success = true;
+                }
+            }
+        }
+
+        if !auth_success {
+            return Err(anyhow::anyhow!("Unable to authenticate with SSH server. Please ensure you have set up SSH keys, ssh-agent, or provide a valid password."));
+        }
+        
+        Ok(session)
+    }
+    
+    pub fn get_connection(&self) -> Result<Session> {
+        // Try to get an existing connection from the pool
+        if let Some(session) = self.connections.lock().unwrap().pop_front() {
+            // Check if the session is still valid
+            if session.authenticated() {
+                return Ok(session);
+            }
+        }
+        
+        // If no valid connection in pool, create a new one (if under limit)
+        let current_count = self.connections.lock().unwrap().len();
+        if current_count < self.max_connections {
+            self.create_new_connection()
+        } else {
+            // If at limit, we need to wait or create a new one anyway
+            // In a production system, we would implement proper waiting
+            // For now, we'll create a new connection regardless of the limit
+            // This is not ideal but prevents deadlocks
+            self.create_new_connection()
+        }
+    }
+    
+    pub fn return_connection(&self, session: Session) {
+        // Return a connection to the pool if it's still valid
+        if session.authenticated() {
+            self.connections.lock().unwrap().push_back(session);
+        }
+    }
+}
 
 pub struct SshTransfer {
+    // We'll keep the original implementation for backward compatibility
+    // But recommend using the connection pool for bulk operations
     session: Session,
 }
 
@@ -89,7 +216,16 @@ impl SshTransfer {
             session,
         })
     }
-
+    
+    // Create SshTransfer from existing session
+    pub fn from_session(session: Session) -> Self {
+        SshTransfer { session }
+    }
+    
+    // Extract session from SshTransfer
+    pub fn into_session(self) -> Session {
+        self.session
+    }
 
     pub async fn send_file(
         &self,
@@ -99,7 +235,6 @@ impl SshTransfer {
         size: u64,
         pb: ProgressBar) -> Result<()> {
         // Create full remote path
-        println!("Sending file: {}, {}, {}", src_root.display(), dest_root.display(), path.display());
         let remote_path = dest_root.join(&path);
         self.create_remote_dir(&dest_root.join(&path).parent().unwrap_or(&dest_root).to_str().unwrap())?;
 
@@ -143,7 +278,6 @@ impl SshTransfer {
         channel.wait_close()?;
         Ok(())
     }
-
 }
 
 fn read_password() -> Result<String> {

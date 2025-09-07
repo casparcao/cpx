@@ -123,11 +123,11 @@ async fn cp_ssh_files(args: Args) -> anyhow::Result<()> {
     let (ssh_dest, remote_path) = parse_ssh_destination(&args.destination)?;
     let remote_root = Path::new(&remote_path);
 
-    // Connect via SSH
-    println!("🔗 Connecting via SSH...");
-    let ssh_transfer = SshTransfer::new(&ssh_dest)?;
-
     let src_root = Path::new(&args.source).parent().unwrap_or(&args.source);
+
+    // Create SSH connection pool
+    println!("🔗 Creating SSH connection pool...");
+    let connection_pool = Arc::new(ssh::SshConnectionPool::new(ssh_dest, args.jobs)?);
 
     // Step 3: Transfer files
     println!("🚀 Starting SSH transfer ({} jobs)...", args.jobs);
@@ -135,7 +135,6 @@ async fn cp_ssh_files(args: Args) -> anyhow::Result<()> {
 
     let semaphore = Arc::new(Semaphore::new(args.jobs));
     let mut handles = vec![];
-    let ssh_transfer = Arc::new(ssh_transfer);
     let walker = walkdir::WalkDir::new(&args.source);
     walker.into_iter().filter_map(Result::ok).for_each(|entry| {
         let path = entry.path();
@@ -145,30 +144,46 @@ async fn cp_ssh_files(args: Args) -> anyhow::Result<()> {
             let remote_root = remote_root.to_path_buf();
             let path = path.strip_prefix(&src_root).unwrap().to_path_buf();
             let sem = semaphore.clone();
-            let ssh_transfer = ssh_transfer.clone();
             let m = m.clone();
+            let pool = connection_pool.clone();
             let h = tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
+                
+                // Get connection from pool
+                let ssh_session = match pool.get_connection() {
+                    Ok(session) => session,
+                    Err(e) => {
+                        eprintln!("Failed to get SSH connection from pool: {}", e);
+                        return;
+                    }
+                };
+                
+                // Wrap session in SshTransfer for compatibility
+                let ssh_transfer = ssh::SshTransfer::from_session(ssh_session);
+                
                 let pb = m.add(ProgressBar::new(size));
                 let sty = ProgressStyle::with_template("{msg} {bar:40} {bytes}/{total_bytes} ({eta})")
                     .unwrap()
                     .progress_chars("=>-");
                 pb.set_style(sty);
                 pb.set_message(utils::align_str(path.to_str().unwrap(), 20));
+                
                 // Send via SSH
                 let r = ssh_transfer.send_file(src_root, remote_root, path, size, pb).await;
+                
+                // Return connection to pool
+                pool.return_connection(ssh_transfer.into_session());
+                
                 match r {
                     Ok(_) => {},
                     Err(e) => {
-                        println!("Error: {}", e);
+                        eprintln!("Error: {}", e);
                     }
                 }
             });
-
             handles.push(h);
         }
     });
-
     // Wait for all transfers
     for h in handles {
         let _ = h.await;
