@@ -140,7 +140,6 @@ async fn cp_ssh_files(args: Args) -> anyhow::Result<()> {
     walker.into_iter().filter_map(Result::ok).for_each(|entry| {
         let path = entry.path();
         if path.is_file() {
-            println!("processing file : {}, {}, {}", src_root.display(),  remote_root.display(), path.display());
             let size = path.metadata().unwrap().len();
             let src_root = src_root.to_path_buf();
             let remote_root = remote_root.to_path_buf();
@@ -157,7 +156,13 @@ async fn cp_ssh_files(args: Args) -> anyhow::Result<()> {
                 pb.set_style(sty);
                 pb.set_message(utils::align_str(path.to_str().unwrap(), 20));
                 // Send via SSH
-                let _ = ssh_transfer.send_file(src_root, remote_root, path, size, pb);
+                let r = ssh_transfer.send_file(src_root, remote_root, path, size, pb).await;
+                match r {
+                    Ok(_) => {},
+                    Err(e) => {
+                        println!("Error: {}", e);
+                    }
+                }
             });
 
             handles.push(h);

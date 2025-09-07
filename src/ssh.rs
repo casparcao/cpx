@@ -91,7 +91,7 @@ impl SshTransfer {
     }
 
 
-    pub fn send_file(
+    pub async fn send_file(
         &self,
         src_root: PathBuf,
         dest_root: PathBuf,
@@ -99,6 +99,7 @@ impl SshTransfer {
         size: u64,
         pb: ProgressBar) -> Result<()> {
         // Create full remote path
+        println!("Sending file: {}, {}, {}", src_root.display(), dest_root.display(), path.display());
         let remote_path = dest_root.join(&path);
         self.create_remote_dir(&dest_root.to_str().unwrap())?;
 
@@ -136,6 +137,9 @@ impl SshTransfer {
         // Execute mkdir command to create directory
         let mut channel = self.session.channel_session()?;
         channel.exec(&format!("mkdir -p {}", remote_path))?;
+        let mut s = String::new();
+        channel.read_to_string(&mut s)?;
+        println!("mkdir output: {}", s);
         channel.send_eof()?;
         channel.wait_eof()?;
         channel.close()?;
