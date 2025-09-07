@@ -10,7 +10,8 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::collections::VecDeque;
 
 pub struct SshConnectionPool {
@@ -27,13 +28,10 @@ impl SshConnectionPool {
             max_connections,
         };
         
-        // Pre-create one connection to test the setup
-        let session = pool.create_new_connection()?;
-        pool.connections.lock().unwrap().push_back(session);
         Ok(pool)
     }
     
-    fn create_new_connection(&self) -> Result<Session> {
+    async fn create_new_connection(&self) -> Result<Session> {
         // Further parse user@host into user and host
         let parts: Vec<&str> = self.ssh_dest.split('@').collect();
         let (user, host) = if parts.len() == 2 {
@@ -108,33 +106,54 @@ impl SshConnectionPool {
         Ok(session)
     }
     
-    pub fn get_connection(&self) -> Result<Session> {
+    pub async fn get_connection(&self) -> Result<Session> {
         // Try to get an existing connection from the pool
-        if let Some(session) = self.connections.lock().unwrap().pop_front() {
+        let mut connections = self.connections.lock().await;
+        while let Some(session) = connections.pop_front() {
             // Check if the session is still valid
             if session.authenticated() {
-                return Ok(session);
+                // Additional check to see if session is still responsive
+                match session.channel_session() {
+                    Ok(mut channel) => {
+                        // Close the test channel
+                        let _ = channel.close();
+                        let _ = channel.wait_close();
+                        return Ok(session);
+                    }
+                    Err(_) => {
+                        // Session is not responsive, continue to next session
+                        continue;
+                    }
+                }
             }
         }
         
-        // If no valid connection in pool, create a new one (if under limit)
-        let current_count = self.connections.lock().unwrap().len();
-        if current_count < self.max_connections {
-            self.create_new_connection()
+        // Check if we can create a new connection without exceeding the limit
+        if connections.len() < self.max_connections {
+            // If no valid connection in pool, create a new one
+            drop(connections); // Release the lock before creating a new connection
+            self.create_new_connection().await
         } else {
-            // If at limit, we need to wait or create a new one anyway
-            // In a production system, we would implement proper waiting
-            // For now, we'll create a new connection regardless of the limit
-            // This is not ideal but prevents deadlocks
-            self.create_new_connection()
+            // Pool is at maximum capacity, need to wait for a connection to be returned
+            // For now, we'll return an error and let the caller handle retries
+            Err(anyhow::anyhow!("SSH connection pool at maximum capacity"))
         }
     }
     
-    pub fn return_connection(&self, session: Session) {
-        // Return a connection to the pool if it's still valid
-        if session.authenticated() {
-            self.connections.lock().unwrap().push_back(session);
+    pub async fn return_connection(&self, session: Session) {
+        let mut connections = self.connections.lock().await;
+        
+        // Only return connection to pool if it's still valid and we're under the limit
+        if session.authenticated() && connections.len() < self.max_connections {
+            // Test if session is still responsive before returning to pool
+            if let Ok(mut channel) = session.channel_session() {
+                // Close the test channel
+                let _ = channel.close();
+                let _ = channel.wait_close();
+                connections.push_back(session);
+            }
         }
+        // If the connection is not valid or we're at capacity, it will be dropped and cleaned up
     }
 }
 

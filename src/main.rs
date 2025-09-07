@@ -148,12 +148,14 @@ async fn cp_ssh_files(args: Args) -> anyhow::Result<()> {
             let h = tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 
-                // Get connection from pool
-                let ssh_session = match pool.get_connection() {
-                    Ok(session) => session,
-                    Err(e) => {
-                        eprintln!("Failed to get SSH connection from pool: {}", e);
-                        return;
+                // Try to get connection from pool with retry logic
+                let ssh_session = loop {
+                    match pool.get_connection().await {
+                        Ok(session) => break session,
+                        Err(e) => {
+                            eprintln!("Failed to get SSH connection from pool: {}. Retrying in 1 second...", e);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        }
                     }
                 };
                 
@@ -171,7 +173,7 @@ async fn cp_ssh_files(args: Args) -> anyhow::Result<()> {
                 let r = ssh_transfer.send_file(src_root, remote_root, path, size, pb).await;
                 
                 // Return connection to pool
-                pool.return_connection(ssh_transfer.into_session());
+                pool.return_connection(ssh_transfer.into_session()).await;
                 
                 match r {
                     Ok(_) => {},
