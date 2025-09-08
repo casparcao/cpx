@@ -107,37 +107,30 @@ impl SshConnectionPool {
     }
     
     pub async fn get_connection(&self) -> Result<Session> {
-        // Try to get an existing connection from the pool
-        let mut connections = self.connections.lock().await;
-        while let Some(session) = connections.pop_front() {
-            // Check if the session is still valid
-            if session.authenticated() {
-                // Additional check to see if session is still responsive
-                match session.channel_session() {
-                    Ok(mut channel) => {
-                        // Close the test channel
-                        let _ = channel.close();
-                        let _ = channel.wait_close();
-                        return Ok(session);
-                    }
-                    Err(_) => {
-                        // Session is not responsive, continue to next session
-                        continue;
+        {
+            // Try to get an existing connection from the pool
+            let mut connections = self.connections.lock().await;
+            while let Some(session) = connections.pop_front() {
+                // Check if the session is still valid
+                if session.authenticated() {
+                    // Additional check to see if session is still responsive
+                    match session.channel_session() {
+                        Ok(mut channel) => {
+                            // Close the test channel
+                            let _ = channel.close();
+                            let _ = channel.wait_close();
+                            return Ok(session);
+                        }
+                        Err(e) => {
+                            // Session is not responsive, continue to next session
+                            eprintln!("Session is not responsive, continuing to next session. {}", e);
+                            continue;
+                        }
                     }
                 }
             }
         }
-        
-        // Check if we can create a new connection without exceeding the limit
-        if connections.len() < self.max_connections {
-            // If no valid connection in pool, create a new one
-            drop(connections); // Release the lock before creating a new connection
-            self.create_new_connection().await
-        } else {
-            // Pool is at maximum capacity, need to wait for a connection to be returned
-            // For now, we'll return an error and let the caller handle retries
-            Err(anyhow::anyhow!("SSH connection pool at maximum capacity"))
-        }
+        self.create_new_connection().await
     }
     
     pub async fn return_connection(&self, session: Session) {
