@@ -11,7 +11,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::io::{self, Write};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use std::collections::VecDeque;
 
 pub struct SshConnectionPool {
@@ -31,7 +31,7 @@ impl SshConnectionPool {
         Ok(pool)
     }
     
-    async fn create_new_connection(&self) -> Result<Session> {
+     fn create_new_connection(&self) -> Result<Session> {
         // Further parse user@host into user and host
         let parts: Vec<&str> = self.ssh_dest.split('@').collect();
         let (user, host) = if parts.len() == 2 {
@@ -106,10 +106,10 @@ impl SshConnectionPool {
         Ok(session)
     }
     
-    pub async fn get_connection(&self) -> Result<Session> {
+    pub  fn get_connection(&self) -> Result<Session> {
         {
             // Try to get an existing connection from the pool
-            let mut connections = self.connections.lock().await;
+            let mut connections = self.connections.lock().unwrap();
             while let Some(session) = connections.pop_front() {
                 // Check if the session is still valid
                 if session.authenticated() {
@@ -130,11 +130,11 @@ impl SshConnectionPool {
                 }
             }
         }
-        self.create_new_connection().await
+        self.create_new_connection()
     }
     
-    pub async fn return_connection(&self, session: Session) {
-        let mut connections = self.connections.lock().await;
+    pub  fn return_connection(&self, session: Session) {
+        let mut connections = self.connections.lock().unwrap();
         
         // Only return connection to pool if it's still valid and we're under the limit
         if session.authenticated() && connections.len() < self.max_connections {
@@ -168,7 +168,7 @@ impl SshTransfer {
         self.session
     }
 
-    pub async fn send_file(
+    pub  fn send_file(
         &self,
         src_root: PathBuf,
         dest_root: PathBuf,
