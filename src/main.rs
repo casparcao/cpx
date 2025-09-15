@@ -1,4 +1,5 @@
 use clap::Parser;
+use tokio::runtime::Builder;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -55,20 +56,29 @@ async fn send_file(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+//#[tokio::main]
+fn main() -> anyhow::Result<()> {
+    let rt = Builder::new_multi_thread()
+        .worker_threads(4) // 核心异步线程数
+        .max_blocking_threads(4) // 设置阻塞线程池的最大线程数
+        .enable_all()
+        .build()
+        .unwrap();
 
-    let dest_parts = args.destination.split(":").collect::<Vec<_>>();
+    let _ = rt.block_on(async {
+        let args = Args::parse();
 
-    if dest_parts.len() == 2 {
-        cp_ssh_files(args).await?;
-    } else if dest_parts.len() == 1 {
-        cp_local_files(args).await?;
-    } else {
-        anyhow::bail!("Invalid destination format");
-    }
-    
+        let dest_parts = args.destination.split(":").collect::<Vec<_>>();
+
+        if dest_parts.len() == 2 {
+            cp_ssh_files(args).await
+        } else if dest_parts.len() == 1 {
+            cp_local_files(args).await
+        } else {
+            anyhow::bail!("Invalid destination format");
+        }
+    });
+
     Ok(())
 }
 
@@ -147,7 +157,6 @@ async fn cp_ssh_files(args: Args) -> anyhow::Result<()> {
             let pool = connection_pool.clone();
             let h = tokio::task::spawn_blocking(move || {
                 // let _permit = sem.acquire().await.unwrap();
-                
                 // Try to get connection from pool with retry logic
                 let ssh_session = loop {
                     match pool.get_connection(){
@@ -161,7 +170,6 @@ async fn cp_ssh_files(args: Args) -> anyhow::Result<()> {
                 
                 // Wrap session in SshTransfer for compatibility
                 let ssh_transfer = ssh::SshTransfer::from_session(ssh_session);
-                println!("processing file: {}", path.display());
                 let pb = m.add(ProgressBar::new(size));
                 let sty = ProgressStyle::with_template("{msg} {bar:40} {bytes}/{total_bytes} ({eta})")
                     .unwrap()
