@@ -41,7 +41,6 @@ async fn send_file(
     let mut input = BufReader::new(File::open(&src_path)?);
     let mut output = BufWriter::new(File::create(&dest_path)?);
     let mut buffer = vec![0; 8192];
-    let mut written = 0u64;
     loop {
         let n = input.read(&mut buffer)?;
         if n == 0 {
@@ -49,7 +48,6 @@ async fn send_file(
         }
         let data = &buffer[..n];
         output.write_all(data)?;
-        written += n as u64;
         pb.inc(n as u64);
     }
     Ok(())
@@ -85,43 +83,53 @@ async fn cp_local_files(args: Args) -> anyhow::Result<()> {
     let src_root = Path::new(&args.source).parent().unwrap_or(&args.source);
     let dest_root = Path::new(&args.destination);
     println!("Copying from {} to {}", src_root.display(), dest_root.display());
-    let m = Arc::new(MultiProgress::new());
-
-    let semaphore = Arc::new(Semaphore::new(args.jobs));
-    let mut handles = vec![];
-
+    
+    // Calculate total size for progress bar
+    let mut total_size = 0u64;
+    let mut files = Vec::new();
     let walker = walkdir::WalkDir::new(&args.source);
     walker.into_iter().filter_map(Result::ok).for_each(|entry| {
         let path = entry.path();
         if path.is_file() {
             let size = path.metadata().unwrap().len();
-            let src_root = src_root.to_path_buf();
-            let dest_root = dest_root.to_path_buf();
-            let path = path.strip_prefix(&src_root).unwrap().to_path_buf();
-            println!("processing file2 :{}, {}", src_root.display(), path.display());
-            let sem = semaphore.clone();
-            let m = m.clone();
-
-            let h = tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                
-                let pb = m.add(ProgressBar::new(size));
-                let sty = ProgressStyle::with_template("{msg} {bar:40} {bytes}/{total_bytes} ({eta})")
-                    .unwrap()
-                    .progress_chars("=>-");
-                pb.set_style(sty);
-                pb.set_message(utils::align_str(path.to_str().unwrap(), 20));
-                let _ = send_file(src_root, dest_root, path, pb).await;
-            });
-            handles.push(h);
+            // 只处理非空文件
+            if size > 0 {
+                total_size += size;
+                let path = path.strip_prefix(&src_root).unwrap().to_path_buf();
+                files.push((path, size));
+            }
         }
     });
+
+    // Create a single progress bar for all files
+    let pb = ProgressBar::new(total_size);
+    let sty = ProgressStyle::with_template("{bar:40} {bytes}/{total_bytes} ({eta})")
+        .unwrap()
+        .progress_chars("=>-");
+    pb.set_style(sty);
+
+    let semaphore = Arc::new(Semaphore::new(args.jobs));
+    let mut handles = vec![];
+
+    for (path, size) in files {
+        let src_root = src_root.to_path_buf();
+        let dest_root = dest_root.to_path_buf();
+        let sem = semaphore.clone();
+        let pb = pb.clone();
+
+        let h = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let _ = send_file(src_root, dest_root, path, pb.clone()).await;
+        });
+        handles.push(h);
+    }
 
     // Wait for all transfers
     for h in handles {
         let _ = h.await;
     }
-
+    
+    pb.finish_and_clear();
     println!("✅ Transfer completed!");
     Ok(())
 }
@@ -148,9 +156,12 @@ async fn cp_ssh_files(args: Args) -> anyhow::Result<()> {
         let path = entry.path();
         if path.is_file() {
             let size = path.metadata().unwrap().len();
-            total_size += size;
-            let path = path.strip_prefix(&src_root).unwrap().to_path_buf();
-            files.push((path, size));
+            // 只处理非空文件
+            if size > 0 {
+                total_size += size;
+                let path = path.strip_prefix(&src_root).unwrap().to_path_buf();
+                files.push((path, size));
+            }
         }
     });
 
@@ -193,6 +204,8 @@ async fn cp_ssh_files(args: Args) -> anyhow::Result<()> {
                 Ok(_) => {},
                 Err(e) => {
                     eprintln!("Error: {}", e);
+                    // 即使出错也要更新进度条
+                    pb.inc(size);
                 }
             }
         });

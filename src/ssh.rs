@@ -205,7 +205,6 @@ impl SshTransfer {
         channel.wait_eof()?;
         channel.close()?;
         channel.wait_close()?;
-        pb.finish_and_clear();
         Ok(())
     }
 
