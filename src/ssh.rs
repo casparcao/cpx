@@ -199,7 +199,7 @@ impl SshTransfer {
             let data = &buffer[..n];
             channel.write_all(data)?;
             written += n as u64;
-            pb.set_position(written);
+            pb.inc(n as u64);
         }
         channel.send_eof()?;
         channel.wait_eof()?;

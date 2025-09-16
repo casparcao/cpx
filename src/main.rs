@@ -50,9 +50,8 @@ async fn send_file(
         let data = &buffer[..n];
         output.write_all(data)?;
         written += n as u64;
-        pb.set_position(written);
+        pb.inc(n as u64);
     }
-    pb.finish_and_clear();
     Ok(())
 }
 
@@ -140,65 +139,73 @@ async fn cp_ssh_files(args: Args) -> anyhow::Result<()> {
 
     // Step 3: Transfer files
     println!("🚀 Starting SSH transfer ({} jobs)...", args.jobs);
-    let m = Arc::new(MultiProgress::new());
-
-    // let semaphore = Arc::new(Semaphore::new(args.jobs));
-    let mut handles = vec![];
+    
+    // Calculate total size for progress bar
+    let mut total_size = 0u64;
+    let mut files = Vec::new();
     let walker = walkdir::WalkDir::new(&args.source);
     walker.into_iter().filter_map(Result::ok).for_each(|entry| {
         let path = entry.path();
         if path.is_file() {
             let size = path.metadata().unwrap().len();
-            let src_root = src_root.to_path_buf();
-            let remote_root = remote_root.to_path_buf();
+            total_size += size;
             let path = path.strip_prefix(&src_root).unwrap().to_path_buf();
-            // let sem = semaphore.clone();
-            let m = m.clone();
-            let pool = connection_pool.clone();
-            let h = tokio::task::spawn_blocking(move || {
-                // let _permit = sem.acquire().await.unwrap();
-                // Try to get connection from pool with retry logic
-                let ssh_session = loop {
-                    match pool.get_connection(){
-                        Ok(session) => break session,
-                        Err(e) => {
-                            eprintln!("Failed to get SSH connection from pool: {}. Retrying in 1 second...", e);
-                            std::thread::sleep(tokio::time::Duration::from_secs(1));
-                        }
-                    }
-                };
-                
-                // Wrap session in SshTransfer for compatibility
-                let ssh_transfer = ssh::SshTransfer::from_session(ssh_session);
-                let pb = m.add(ProgressBar::new(size));
-                let sty = ProgressStyle::with_template("{msg} {bar:40} {bytes}/{total_bytes} ({eta})")
-                    .unwrap()
-                    .progress_chars("=>-");
-                pb.set_style(sty);
-                pb.set_message(utils::align_str(path.to_str().unwrap(), 20));
-                
-                // Send via SSH
-                let r = ssh_transfer.send_file(src_root, remote_root, path, size, pb);
-                
-                // Return connection to pool
-                pool.return_connection(ssh_transfer.into_session());
-                
-                match r {
-                    Ok(_) => {},
-                    Err(e) => {
-                        eprintln!("Error: {}", e);
-                    }
-                }
-            });
-            handles.push(h);
+            files.push((path, size));
         }
     });
+
+    // Create a single progress bar for all files
+    let pb = ProgressBar::new(total_size);
+    let sty = ProgressStyle::with_template("{bar:40} {bytes}/{total_bytes} ({eta})")
+        .unwrap()
+        .progress_chars("=>-");
+    pb.set_style(sty);
+
+    let mut handles = vec![];
+    for (path, size) in files {
+        let src_root = src_root.to_path_buf();
+        let remote_root = remote_root.to_path_buf();
+        let pool = connection_pool.clone();
+        let pb = pb.clone();
+        
+        let h = tokio::task::spawn_blocking(move || {
+            // Try to get connection from pool with retry logic
+            let ssh_session = loop {
+                match pool.get_connection(){
+                    Ok(session) => break session,
+                    Err(e) => {
+                        eprintln!("Failed to get SSH connection from pool: {}. Retrying in 1 second...", e);
+                        std::thread::sleep(tokio::time::Duration::from_secs(1));
+                    }
+                }
+            };
+            
+            // Wrap session in SshTransfer for compatibility
+            let ssh_transfer = ssh::SshTransfer::from_session(ssh_session);
+            
+            // Send via SSH
+            let r = ssh_transfer.send_file(src_root, remote_root, path, size, pb.clone());
+            
+            // Return connection to pool
+            pool.return_connection(ssh_transfer.into_session());
+            
+            match r {
+                Ok(_) => {},
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                }
+            }
+        });
+        handles.push(h);
+    }
+
     println!("🚀 Starting SSH transfer ({} jobs)...{}", args.jobs, handles.len());
     // Wait for all transfers
     for h in handles {
         let _ = h.await;
     }
-
+    
+    pb.finish_and_clear();
     println!("✅ SSH transfer completed!");
     Ok(())
 }
