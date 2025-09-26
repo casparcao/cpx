@@ -1,11 +1,6 @@
 use anyhow::Result;
-use indicatif::ProgressBar;
 use ssh2::Session;
-use std::fs::File;
-use std::io::prelude::*;
-use std::io::BufReader;
 use std::net::TcpStream;
-use std::path::Path;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -150,75 +145,7 @@ impl SshConnectionPool {
     }
 }
 
-pub struct SshTransfer {
-    // We'll keep the original implementation for backward compatibility
-    // But recommend using the connection pool for bulk operations
-    session: Session,
-}
 
-impl SshTransfer {
-
-    // Create SshTransfer from existing session
-    pub fn from_session(session: Session) -> Self {
-        SshTransfer { session }
-    }
-    
-    // Extract session from SshTransfer
-    pub fn into_session(self) -> Session {
-        self.session
-    }
-
-    pub  fn send_file(
-        &self,
-        src_root: PathBuf,
-        dest_root: PathBuf,
-        path: PathBuf,
-        size: u64,
-        pb: ProgressBar) -> Result<()> {
-        // Create full remote path
-        let remote_path = dest_root.join(&path);
-        self.create_remote_dir(&dest_root.join(&path).parent().unwrap_or(&dest_root).to_str().unwrap())?;
-
-        let mut input = BufReader::new(File::open(&src_root.join(&path))?);
-        let mut buffer = vec![0; 8192];
-        let mut written = 0u64;
-
-        // Use SCP to send file data
-        let mut channel = self.session.scp_send(
-            Path::new(&remote_path), 
-            0o644, 
-            size, 
-            None
-        )?;
-
-        loop {
-            let n = input.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            let data = &buffer[..n];
-            channel.write_all(data)?;
-            written += n as u64;
-            pb.inc(n as u64);
-        }
-        channel.send_eof()?;
-        channel.wait_eof()?;
-        channel.close()?;
-        channel.wait_close()?;
-        Ok(())
-    }
-
-    pub fn create_remote_dir(&self, remote_path: &str) -> Result<()> {
-        // Execute mkdir command to create directory
-        let mut channel = self.session.channel_session()?;
-        channel.exec(&format!("mkdir -p {}", remote_path))?;
-        channel.send_eof()?;
-        channel.wait_eof()?;
-        channel.close()?;
-        channel.wait_close()?;
-        Ok(())
-    }
-}
 
 fn read_password() -> Result<String> {
     let password = rpassword::read_password()?;

@@ -1,14 +1,11 @@
 use clap::Parser;
-use tokio::runtime::Builder;
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::Semaphore;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
+use tokio::{runtime::Builder, task::JoinHandle};
+use std::path::{PathBuf, Path};
 
 mod ssh;
 mod utils;
+mod local;
 
 const PARALLELISM: usize = 8;
 
@@ -26,128 +23,66 @@ struct Args {
     /// Number of parallel workers
     #[arg(short, long, default_value_t = PARALLELISM)]
     jobs: usize,
-
 }
 
-async fn send_file(
-    src_root: PathBuf,
-    dest_root: PathBuf,
-    path: PathBuf,
-    pb: ProgressBar
-) -> anyhow::Result<()> {
-    let src_path = src_root.join(&path);
-    let dest_path = dest_root.join(&path);
-    fs::create_dir_all(dest_path.parent().unwrap())?;
-    let mut input = BufReader::new(File::open(&src_path)?);
-    let mut output = BufWriter::new(File::create(&dest_path)?);
-    let mut buffer = vec![0; 8192];
-    loop {
-        let n = input.read(&mut buffer)?;
-        if n == 0 {
-            break;
+struct Destination {
+    pub(crate) is_ssh: bool,
+    //root@host
+    pub(crate) ssh_part: String,
+    ///path/xxx
+    pub(crate) remote_path: String,
+}
+
+impl Destination {
+    pub(crate) fn new(destination: &str) -> anyhow::Result<Self> {
+        let dest_parts: Vec<&str> = destination.split(":").collect();
+        if dest_parts.len() == 2 {
+            return Ok(Self {
+                is_ssh: true,
+                ssh_part: dest_parts[0].to_string(),
+                remote_path: dest_parts[1].to_string(),
+            });
+        }else if dest_parts.len() == 1{
+            return Ok(Self {
+                is_ssh: false,
+                ssh_part: "".to_string(),
+                remote_path: destination.to_string(),
+            });
+        }else{
+            Err(anyhow::anyhow!("Invalid destination format. Expected user@host:path or local/path"))
         }
-        let data = &buffer[..n];
-        output.write_all(data)?;
-        pb.inc(n as u64);
     }
-    Ok(())
 }
 
 //#[tokio::main]
 fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
     let rt = Builder::new_multi_thread()
-        .worker_threads(4) // 核心异步线程数
-        .max_blocking_threads(4) // 设置阻塞线程池的最大线程数
+        .worker_threads(args.jobs) // 核心异步线程数
+        .max_blocking_threads(args.jobs) // 设置阻塞线程池的最大线程数
         .enable_all()
         .build()
         .unwrap();
 
     let _ = rt.block_on(async {
-        let args = Args::parse();
-
-        let dest_parts = args.destination.split(":").collect::<Vec<_>>();
-
-        if dest_parts.len() == 2 {
-            cp_ssh_files(args).await
-        } else if dest_parts.len() == 1 {
-            cp_local_files(args).await
-        } else {
-            anyhow::bail!("Invalid destination format");
+        let r = process(&args).await;
+        match r {
+           Ok(_) => {},
+           Err(e) => {eprintln!("Unexpected Error: {}", e);} 
         }
     });
-
     Ok(())
 }
 
-async fn cp_local_files(args: Args) -> anyhow::Result<()> {
-    let src_root = Path::new(&args.source).parent().unwrap_or(&args.source);
-    let dest_root = Path::new(&args.destination);
-    println!("Copying from {} to {}", src_root.display(), dest_root.display());
-    
-    // Calculate total size for progress bar
-    let mut total_size = 0u64;
-    let mut files = Vec::new();
-    let walker = walkdir::WalkDir::new(&args.source);
-    walker.into_iter().filter_map(Result::ok).for_each(|entry| {
-        let path = entry.path();
-        if path.is_file() {
-            let size = path.metadata().unwrap().len();
-            // 只处理非空文件
-            if size > 0 {
-                total_size += size;
-                let path = path.strip_prefix(&src_root).unwrap().to_path_buf();
-                files.push((path, size));
-            }
-        }
-    });
 
-    // Create a single progress bar for all files
-    let pb = ProgressBar::new(total_size);
-    let sty = ProgressStyle::with_template("{bar:40} {bytes}/{total_bytes} ({eta})")
-        .unwrap()
-        .progress_chars("=>-");
-    pb.set_style(sty);
-
-    let semaphore = Arc::new(Semaphore::new(args.jobs));
-    let mut handles = vec![];
-
-    for (path, size) in files {
-        let src_root = src_root.to_path_buf();
-        let dest_root = dest_root.to_path_buf();
-        let sem = semaphore.clone();
-        let pb = pb.clone();
-
-        let h = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            let _ = send_file(src_root, dest_root, path, pb.clone()).await;
-        });
-        handles.push(h);
-    }
-
-    // Wait for all transfers
-    for h in handles {
-        let _ = h.await;
-    }
-    
-    pb.finish_and_clear();
-    println!("✅ Transfer completed!");
-    Ok(())
-}
-
-async fn cp_ssh_files(args: Args) -> anyhow::Result<()> {
+async fn process(args: &Args) -> anyhow::Result<()> { 
     // Parse destination
-    let (ssh_dest, remote_path) = parse_ssh_destination(&args.destination)?;
-    let remote_root = Path::new(&remote_path);
-
+    let Destination{is_ssh, ssh_part, remote_path} = Destination::new(&args.destination)?;
+    //目标路径
+    let target_root = Path::new(&remote_path);
+    //源路径
     let src_root = Path::new(&args.source).parent().unwrap_or(&args.source);
-
-    // Create SSH connection pool
-    println!("🔗 Creating SSH connection pool...");
-    let connection_pool = Arc::new(ssh::SshConnectionPool::new(ssh_dest, args.jobs)?);
-
-    // Step 3: Transfer files
-    println!("🚀 Starting SSH transfer ({} jobs)...", args.jobs);
-    
+    println!("🚀 Start scanning files...");
     // Calculate total size for progress bar
     let mut total_size = 0u64;
     let mut files = Vec::new();
@@ -164,72 +99,23 @@ async fn cp_ssh_files(args: Args) -> anyhow::Result<()> {
             }
         }
     });
-
-    // Create a single progress bar for all files
+    println!("🚀 A total of {} files to be transferred...", &files.len());
     let pb = ProgressBar::new(total_size);
-    let sty = ProgressStyle::with_template("{bar:40} {bytes}/{total_bytes} ({eta})")
+    let sty = ProgressStyle::with_template("{msg} {bar:40} {bytes}/{total_bytes} ({eta})")
         .unwrap()
         .progress_chars("=>-");
     pb.set_style(sty);
-
-    let mut handles = vec![];
-    for (path, size) in files {
-        let src_root = src_root.to_path_buf();
-        let remote_root = remote_root.to_path_buf();
-        let pool = connection_pool.clone();
-        let pb = pb.clone();
-        
-        let h = tokio::task::spawn_blocking(move || {
-            // Try to get connection from pool with retry logic
-            let ssh_session = loop {
-                match pool.get_connection(){
-                    Ok(session) => break session,
-                    Err(e) => {
-                        eprintln!("Failed to get SSH connection from pool: {}. Retrying in 1 second...", e);
-                        std::thread::sleep(tokio::time::Duration::from_secs(1));
-                    }
-                }
-            };
-            
-            // Wrap session in SshTransfer for compatibility
-            let ssh_transfer = ssh::SshTransfer::from_session(ssh_session);
-            
-            // Send via SSH
-            let r = ssh_transfer.send_file(src_root, remote_root, path, size, pb.clone());
-            
-            // Return connection to pool
-            pool.return_connection(ssh_transfer.into_session());
-            
-            match r {
-                Ok(_) => {},
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    // 即使出错也要更新进度条
-                    pb.inc(size);
-                }
-            }
-        });
-        handles.push(h);
+    let mut handles: Vec<JoinHandle<()>> = vec![];
+    if is_ssh {
+        ssh::copy_files(ssh_part, src_root, target_root, files, &pb, args.jobs, &mut handles)?;
+    }else{
+        local::copy_files(src_root, target_root, files, &pb, &mut handles);
     }
-
-    println!("🚀 Starting SSH transfer ({} jobs)...{}", args.jobs, handles.len());
-    // Wait for all transfers
+    println!("🚀 Start transfering ({} jobs)...", args.jobs);
     for h in handles {
         let _ = h.await;
     }
-    
-    pb.finish_and_clear();
-    println!("✅ SSH transfer completed!");
+    println!("✅ Transfer done!");
     Ok(())
 }
 
-// Helper function to parse SSH destination
-fn parse_ssh_destination(destination: &str) -> anyhow::Result<(String, String)> {
-    // Format: user@host:path
-    let dest_parts: Vec<&str> = destination.split(":").collect();
-    if dest_parts.len() == 2 {
-        return Ok((dest_parts[0].to_string(), dest_parts[1].to_string()));
-    }else{
-        Err(anyhow::anyhow!("Invalid SSH destination format. Expected user@host:path"))
-    }
-}
