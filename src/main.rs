@@ -100,22 +100,28 @@ async fn process(args: &Args) -> anyhow::Result<()> {
         }
     });
     println!("🚀 A total of {} files to be transferred...", &files.len());
+    
+    // Create a single progress bar for all files
     let pb = ProgressBar::new(total_size);
     let sty = ProgressStyle::with_template("{msg} {bar:40} {bytes}/{total_bytes} ({eta})")
         .unwrap()
         .progress_chars("=>-");
     pb.set_style(sty);
+    
+    // Print transfer start message before starting the transfer tasks
+    println!("🚀 Start transfering ({} jobs)...", args.jobs);
+    
     let mut handles: Vec<JoinHandle<()>> = vec![];
     if is_ssh {
         ssh::copy_files(ssh_part, src_root, target_root, files, &pb, args.jobs, &mut handles)?;
     }else{
         local::copy_files(src_root, target_root, files, &pb, &mut handles);
     }
-    println!("🚀 Start transfering ({} jobs)...", args.jobs);
+    
     for h in handles {
         let _ = h.await;
     }
+    pb.finish_and_clear();
     println!("✅ Transfer done!");
     Ok(())
 }
-
