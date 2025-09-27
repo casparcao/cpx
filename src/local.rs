@@ -42,7 +42,7 @@ pub(crate) async fn send_file(
     let mut input = BufReader::new(File::open(&src_path)?);
     let mut output = BufWriter::new(File::create(&dest_path)?);
     let mut buffer = vec![0; 8192];
-    pb.set_message(crate::utils::align_str(&path.to_string_lossy(), 20));
+    pb.set_message(crate::utils::align_str(&path.to_string_lossy(), 50));
     loop {
         let n = input.read(&mut buffer)?;
         if n == 0 {

@@ -22,7 +22,7 @@ pub  fn send_file(
 
     let mut input = BufReader::new(File::open(&src_root.join(&path))?);
     let mut buffer = vec![0; 8192];
-    pb.set_message(crate::utils::align_str(&path.to_string_lossy(), 20));
+    pb.set_message(crate::utils::align_str(&path.to_string_lossy(), 50));
 
     // Use SCP to send file data
     let mut channel = session.scp_send(
